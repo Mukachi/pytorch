@@ -5,7 +5,10 @@ pathways, taking into account the AOTConfig and the collected ViewAndMutationMet
 """
 
 import dataclasses
-from typing import Any, Optional
+import functools
+import inspect
+from typing import Any, Callable, NamedTuple, Optional, Sequence
+from typing_extensions import Self
 
 import torch
 import torch.utils._pytree as pytree
@@ -23,7 +26,7 @@ from .functional_utils import (
     assert_functional_graph,
     propagate_input_mutation_stacktraces,
 )
-from .schemas import AOTConfig, SubclassMeta, ViewAndMutationMeta
+from .schemas import AOTConfig, SubclassMeta, SubclassTracingInfo, ViewAndMutationMeta
 from .traced_function_transforms import (
     aot_dispatch_subclass,
     create_functionalized_fn,
@@ -84,41 +87,12 @@ def aot_dispatch_base_graph(
     # While cases that it does need to handle include:
     # - input mutations (including when inputs are aliases of each other)
     # - input metadata mutations
-    fn_to_trace = fn_input_mutations_to_outputs(
-        flat_fn,
-        fw_metadata,
-        keep_data_input_mutations=aot_config.keep_inference_input_mutations,
-    )
 
-    fn_to_trace, updated_flat_args = create_functionalized_fn(
-        fn_to_trace,
-        flat_args,
-        meta=fw_metadata,
-        aot_config=aot_config,
-        trace_joint=False,
+    state, subclass_tracing_info = wrap_and_run(
+        flat_fn, flat_args, fw_metadata, aot_config, is_autograd=False
     )
-
-    # TODO: replace with AOTDispatchSubclassWrapper once we refactor
-    # fn_input_mutations_to_outputs and create_functionalized_fn
-    # into CompilerWrappers.
-    (
-        fn_to_trace,
-        updated_flat_args_subclasses_desugared,
-        maybe_subclass_meta,
-    ) = aot_dispatch_subclass(
-        fn_to_trace,
-        updated_flat_args,
-        is_joint_structure=False,
-        meta=fw_metadata,
-        fw_only=flat_fn,
-    )
-
-    (fn_to_trace, updated_flat_args_subclasses_desugared) = handle_effect_tokens_fn(
-        fn_to_trace,
-        updated_flat_args_subclasses_desugared,
-        meta=fw_metadata,
-        trace_joint=False,
-    )
+    fn_to_trace, updated_flat_args_subclasses_desugared, fw_metadata = state
+    maybe_subclass_meta = subclass_tracing_info[-1] if subclass_tracing_info else None
 
     aot_graphs_log.debug(
         "aot_config id: %s, fw_metadata=%s,subclass_metadata=%s",
@@ -241,6 +215,8 @@ def aot_dispatch_base_graph(
         assert (
             maybe_subclass_meta is None
         ), "aot_export_module does not support tensor subclass inputs for now."
+
+    assert isinstance(saved_updated_flat_args_subclasses_desugared, list)
     return fw_module, saved_updated_flat_args_subclasses_desugared, maybe_subclass_meta
 
 
@@ -258,42 +234,11 @@ def aot_dispatch_autograd_graph(
     # traced_tangents corresponds to the set of outputs in the traced forward that should get grad_outputs in the traced backward.
     # It includes outputs of the original forward, *and* any updated inputs due to input mutations.
     # However, it does *not* include any outputs that are aliases of inputs or intermediates, or any metadata-only input mutations.
-    joint_inputs = (flat_args, fw_metadata.traced_tangents)
 
-    fn_prepared_for_autograd = fn_prepped_for_autograd(
-        flat_fn,
-        fw_metadata,
+    state, subclass_tracing_info = wrap_and_run(
+        flat_fn, flat_args, fw_metadata, aot_config, is_autograd=True
     )
-    joint_fn_to_trace = create_joint(fn_prepared_for_autograd, aot_config=aot_config)
-
-    joint_fn_to_trace, updated_joint_inputs = create_functionalized_fn(
-        joint_fn_to_trace,
-        joint_inputs,
-        meta=fw_metadata,
-        aot_config=aot_config,
-        trace_joint=True,
-    )
-
-    # TODO: replace with AOTDispatchSubclassWrapper once we refactor
-    # fn_input_mutations_to_outputs and create_functionalized_fn
-    # into CompilerWrappers.
-    subclass_tracing_info = aot_dispatch_subclass(
-        joint_fn_to_trace,
-        updated_joint_inputs,
-        is_joint_structure=True,
-        meta=fw_metadata,
-        fw_only=flat_fn,
-    )
-
-    joint_fn_to_trace = subclass_tracing_info.plain_tensor_trace_fn
-    updated_joint_inputs = subclass_tracing_info.plain_tensor_args
-
-    (joint_fn_to_trace, updated_joint_inputs) = handle_effect_tokens_fn(
-        joint_fn_to_trace,
-        updated_joint_inputs,
-        meta=fw_metadata,
-        trace_joint=True,
-    )
+    joint_fn_to_trace, updated_joint_inputs, _ = state
 
     # When we call _create_graph, this may mutate the metadata of joint
     # inputs.  But callers are expecting to get the original joint inputs.  So
@@ -313,7 +258,9 @@ def aot_dispatch_autograd_graph(
         saved_updated_joint_inputs = pytree.tree_map_only(
             torch.Tensor, lambda t: t.detach(), updated_joint_inputs
         )
-    maybe_subclass_meta = subclass_tracing_info.maybe_subclass_meta
+    maybe_subclass_meta = (
+        subclass_tracing_info.maybe_subclass_meta if subclass_tracing_info else None
+    )
 
     fx_g = _create_graph(joint_fn_to_trace, updated_joint_inputs, aot_config=aot_config)
 
@@ -336,3 +283,108 @@ def aot_dispatch_autograd_graph(
             maybe_subclass_meta is None
         ), "aot_export_module does not support tensor subclass inputs for now."
     return fx_g, saved_updated_joint_inputs, maybe_subclass_meta
+
+
+# aot_dispatch_autograd_graph()` and `aot_dispatch_base_graph()` have the same pattern:
+# a series of steps where a base function is repeatedly wrapped, resulting each time in
+# successive new functions with the same signature but more functionality.
+
+
+class WrapState(NamedTuple):
+    fn: Callable[..., Any]
+    args: Sequence[Tensor]
+    meta: ViewAndMutationMeta
+
+
+@dataclasses.dataclass(frozen=True)
+class WrapStep:
+    step_fn: Callable[..., Any]
+    kwargs: dict[str, Any]
+
+    def __call__(self, s: WrapState) -> WrapState:
+        kwargs = {k: getattr(s, k) for k in ("args", "meta") if k in self._params}
+        r = self.step_fn(s.fn, **kwargs, **self.kwargs)
+
+        if isinstance(r, tuple):
+            assert len(r) == 2
+            return WrapState(*r, s.meta)
+        else:
+            assert callable(r)
+            return WrapState(r, s.args, s.meta)
+
+    @functools.cached_property
+    def _params(self) -> frozenset[str]:
+        return frozenset(inspect.signature(self.step_fn).parameters)
+
+
+class WrapSteps:
+    def __init__(self):
+        self.steps = list[WrapStep]()
+
+    def add(self, step_fn: Callable[..., Any], **kwargs: Any) -> Self:
+        self.steps.append(WrapStep(step_fn, kwargs))
+        return self
+
+    def run_all(self, state: WrapState) -> list[WrapState]:
+        return [state] + [state := step(state) for step in self.steps]
+
+    def run(self, state: WrapState) -> WrapState:
+        return self.run_all(state)[-1]
+
+
+def wrap_and_run(
+    flat_fn: Callable[..., Any],
+    flat_args: list[Tensor],
+    fw_metadata: ViewAndMutationMeta,
+    aot_config: AOTConfig,
+    *,
+    is_autograd: bool,
+) -> tuple[WrapState, Optional[SubclassTracingInfo]]:
+    # This gets mutated by _aot_dispatch_subclass
+    subclass_tracing_info: Optional[SubclassTracingInfo] = None
+
+    @functools.wraps(aot_dispatch_subclass)
+    def _aot_dispatch_subclass(
+        fn: Callable[..., Any],
+        args: list[Tensor],
+        **kwargs: Any,
+    ) -> tuple[Callable[..., Any], list[Tensor]]:
+        nonlocal subclass_tracing_info
+        subclass_tracing_info = aot_dispatch_subclass(fn, args, **kwargs)
+        return subclass_tracing_info[:2]
+
+    @functools.wraps(create_functionalized_fn)
+    def _create_functionalized_fn(
+        fn: Callable[..., Any],
+        args: list[Tensor],
+        **kwargs: Any,
+    ) -> tuple[Callable[..., Any], list[Tensor]]:
+        if is_autograd:
+            joint_inputs: Sequence[Any] = flat_args, fw_metadata.traced_tangents
+        else:
+            joint_inputs = args
+        return create_functionalized_fn(fn, joint_inputs, **kwargs)
+
+    steps = WrapSteps()
+    if is_autograd:
+        steps.add(fn_prepped_for_autograd)
+        steps.add(create_joint, aot_config=aot_config)
+    else:
+        steps.add(
+            fn_input_mutations_to_outputs,
+            keep_data_input_mutations=aot_config.keep_inference_input_mutations,
+        )
+    steps.add(
+        create_functionalized_fn,
+        aot_config=aot_config,
+        trace_joint=is_autograd,
+    ).add(
+        _aot_dispatch_subclass,
+        is_joint_structure=is_autograd,
+        fw_only=flat_fn,
+    ).add(
+        handle_effect_tokens_fn,
+        trace_joint=is_autograd,
+    )
+    state = steps.run(WrapState(flat_fn, flat_args, fw_metadata))
+    return state, subclass_tracing_info
