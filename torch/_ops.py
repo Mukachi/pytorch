@@ -377,6 +377,12 @@ class HigherOrderOperator(OperatorBase, abc.ABC):
                     == torch._C._disabled_torch_dispatch_impl
                 ):
                     continue
+                if subclass_type is torch._subclasses.fake_tensor.FakeTensor:
+                    subclass_type = torch._subclasses.fake_tensor.FakeTensorMode
+                    handler = self.python_key_table[subclass_type]
+                    result = handler(arg.fake_mode, *args, **kwargs)
+                    return result
+
                 if subclass_type in self.python_key_table:
                     handler = self.python_key_table[subclass_type]
                     # "natural" calling convention: (*args, **kwargs)
